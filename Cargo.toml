@@ -1,0 +1,18 @@
+[package]
+name = "ksupatch"
+version = "0.1.0"
+edition = "2021"
+description = "Offline patcher that installs KernelSU in LKM mode into a GKI boot image, taking the payload out of the official APK"
+license = "GPL-3.0-only"
+readme = "README.md"
+
+[dependencies]
+miniz_oxide = "0.8"
+android-bootimg = { git = "https://github.com/5ec1cff/android_bootimg", rev = "150425b027c76ea104c82e408571651f2181b2c2" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

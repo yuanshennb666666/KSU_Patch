@@ -1,0 +1,20 @@
+# Build output
+/target
+
+# Patch output written by the tool when no -o is given
+/out
+
+# Firmware inputs and patched images: large, and never part of the source
+*.apk
+*.img
+
+# Downloaded official release assets (re-fetched on demand by tools/verify_payload.py)
+/fixtures/release
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Editor / agent scratch state (the tool that touches this repo keeps its own
+# bookkeeping here; it must never be published)
+.mimocode/

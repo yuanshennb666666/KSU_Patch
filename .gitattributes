@@ -1,0 +1,20 @@
+# Line endings.
+#
+# Stored as LF in the repository; checked out as whatever each platform expects, so a
+# Windows contributor gets CRLF and a POSIX one gets LF without any churn in diffs.
+* text=auto
+
+# Windows scripts: CRLF so they run from a plain cmd prompt.
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# Source and docs: LF everywhere.
+*.rs text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+
+# Not text.
+*.exe binary
+*.ico binary
+*.img binary
+*.apk binary
