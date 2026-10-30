@@ -150,7 +150,9 @@ pub fn vermagic(b: &[u8], info: &ElfInfo) -> Option<String> {
 
 /// Kernel `major.minor` taken from a vermagic string, e.g. `5.10.252-dirty` -> `5.10`.
 pub fn kernel_xy(vermagic: &str) -> Option<String> {
-    let head = vermagic.split(|c: char| !c.is_ascii_digit() && c != '.').next()?;
+    let head = vermagic
+        .split(|c: char| !c.is_ascii_digit() && c != '.')
+        .next()?;
     let mut it = head.split('.');
     let major = it.next()?;
     let minor = it.next()?;
@@ -167,10 +169,7 @@ pub fn ddk_kmi(b: &[u8]) -> Option<String> {
     const NEEDLE: &[u8] = b"/opt/ddk/src/";
     let at = find(b, NEEDLE)? + NEEDLE.len();
     let rest = &b[at..];
-    let end = rest
-        .iter()
-        .position(|&c| c == b'/')
-        .unwrap_or(rest.len());
+    let end = rest.iter().position(|&c| c == b'/').unwrap_or(rest.len());
     let s = String::from_utf8_lossy(&rest[..end.min(32)]).into_owned();
     if s.starts_with("android") && s.contains('-') {
         Some(s)
@@ -200,9 +199,7 @@ pub fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 pub fn contains(haystack: &[u8], needle: &[u8]) -> bool {

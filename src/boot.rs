@@ -40,6 +40,17 @@ pub struct BlockInfo {
     pub format: String,
 }
 
+/// Where the patched ramdisk has to be written back.
+#[derive(Clone, Debug)]
+pub enum RamdiskTarget {
+    /// `boot.img` / `init_boot.img`: the single ramdisk block.
+    Boot,
+    /// `vendor_boot` v3: one vendor ramdisk block, no fragment table.
+    VendorWhole,
+    /// `vendor_boot` v4: one entry of the vendor ramdisk table.
+    VendorEntry { index: usize },
+}
+
 pub struct ImageInfo {
     /// `boot` or `init_boot`.
     pub kind: &'static str,
@@ -55,6 +66,13 @@ pub struct ImageInfo {
     pub kernel_release: Option<String>,
     /// KMI derived from the kernel bytes.
     pub kmi: Option<String>,
+    /// Why the kernel section could not be decompressed, when it could not be. Patching a
+    /// ramdisk does not need the kernel, so this is a warning rather than a failure.
+    pub kernel_error: Option<String>,
+    /// `vendor_boot` v4 fragments, as (`name`, stored bytes).
+    pub ramdisk_fragments: Vec<(String, usize)>,
+    /// The vendor ramdisk fragment chosen for injection.
+    pub ramdisk_name: Option<String>,
 }
 
 fn describe_magic(data: &[u8]) -> String {
@@ -70,6 +88,110 @@ fn describe_magic(data: &[u8]) -> String {
             &data[..8]
         )
     }
+}
+
+fn u32_at(data: &[u8], at: usize) -> Option<u32> {
+    data.get(at..at.checked_add(4)?)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// Parse a boot/vendor_boot image after proving its fixed header is present.
+///
+/// `android-bootimg` slices the fixed header before it validates the file length, so a
+/// truncated image would abort the process. The length check belongs here, before the
+/// dependency sees the bytes.
+fn parse_checked<'a>(data: &'a [u8], label: &str) -> Res<BootImage<'a>> {
+    let (kind, version, minimum) = if data.starts_with(BOOT_MAGIC) {
+        let Some(version) = u32_at(data, 40) else {
+            return Err(fail(
+                IMAGE,
+                "image parsing",
+                label,
+                format!(
+                    "boot image is {} bytes, shorter than the 44-byte header version field",
+                    data.len()
+                ),
+                "the file is truncated; extract the image again from the firmware",
+            ));
+        };
+        let minimum = match version {
+            3 => 1580,
+            4 => 1584,
+            _ => 0,
+        };
+        ("boot", version, minimum)
+    } else if data.starts_with(VENDOR_BOOT_MAGIC) {
+        let Some(version) = u32_at(data, 8) else {
+            return Err(fail(
+                IMAGE,
+                "image parsing",
+                label,
+                format!(
+                    "vendor_boot image is {} bytes, shorter than the 12-byte header version field",
+                    data.len()
+                ),
+                "the file is truncated; extract the image again from the firmware",
+            ));
+        };
+        let minimum = match version {
+            3 => 2112,
+            4 => 2128,
+            _ => 0,
+        };
+        ("vendor_boot", version, minimum)
+    } else {
+        return Err(fail(
+            IMAGE,
+            "image parsing",
+            label,
+            describe_magic(data),
+            "this tool handles GKI boot images only; extract boot.img / init_boot.img / vendor_boot.img from the firmware",
+        ));
+    };
+
+    if minimum == 0 {
+        return Err(fail(
+            IMAGE,
+            "image parsing",
+            label,
+            format!("{kind} header version {version} is not supported"),
+            "only GKI header v3/v4 images are handled",
+        ));
+    }
+    if data.len() < minimum {
+        return Err(fail(
+            IMAGE,
+            "image parsing",
+            label,
+            format!(
+                "{kind} header v{version} needs at least {minimum} bytes, but the file is {} bytes",
+                data.len()
+            ),
+            "the image is truncated; extract it again from the firmware",
+        ));
+    }
+    if kind == "vendor_boot" {
+        let page_size = u32_at(data, 12).unwrap_or(0) as usize;
+        if page_size < 512 || !page_size.is_power_of_two() {
+            return Err(fail(
+                IMAGE,
+                "image parsing",
+                label,
+                format!("vendor_boot page size {page_size} is not a power of two >= 512"),
+                "the vendor_boot header is malformed; extract the image again from the firmware",
+            ));
+        }
+    }
+
+    BootImage::parse(data).map_err(|e| {
+        fail(
+            IMAGE,
+            "image parsing",
+            label,
+            format!("cannot parse header: {e} ({})", describe_magic(data)),
+            "this tool handles GKI boot images only; a raw or repacked partition dump may need to be re-extracted",
+        )
+    })
 }
 
 /// Parse and describe a boot / init_boot image.
@@ -114,26 +236,14 @@ pub fn inspect(data: &[u8], label: &str) -> Res<ImageInfo> {
         }
     }
 
-    let image = BootImage::parse(data).map_err(|e| {
-        fail(
-            IMAGE,
-            "image parsing",
-            label,
-            format!("cannot parse header: {e} ({})", describe_magic(data)),
-            "this tool handles GKI boot images only; a raw or repacked partition dump may need to be re-extracted",
-        )
-    })?;
+    let image = parse_checked(data, label)?;
 
+    let mut is_vendor = false;
     let version = match image.get_header().get_version() {
         BootImageVersion::Android(v) => v,
         BootImageVersion::Vendor(v) => {
-            return Err(fail(
-                IMAGE,
-                "image parsing",
-                label,
-                format!("this is a vendor_boot image (version {v})"),
-                "vendor_boot is out of scope: patch boot.img or init_boot.img instead",
-            ));
+            is_vendor = true;
+            v
         }
         BootImageVersion::RawRamdisk => {
             return Err(fail(
@@ -146,66 +256,129 @@ pub fn inspect(data: &[u8], label: &str) -> Res<ImageInfo> {
         }
     };
 
-    if version < 3 {
-        return Err(fail(
-            IMAGE,
-            "image parsing",
-            label,
-            format!("boot header version {version} is a legacy format (v0/v1/v2)"),
-            "KernelSU's module loading relies on the GKI ramdisk layout, which only exists \
-             from boot header v3 upward (Android 11+ / kernel 5.10+). This device is not \
-             supported by the module-based install",
-        ));
-    }
-    if version > 4 {
-        return Err(fail(
-            IMAGE,
-            "image parsing",
-            label,
-            format!("boot header version {version} is newer than this build understands"),
-            "update the tool",
-        ));
+    if is_vendor {
+        if !(3..=4).contains(&version) {
+            return Err(fail(
+                IMAGE,
+                "image parsing",
+                label,
+                format!("vendor_boot header version {version} is not supported"),
+                "only vendor_boot v3/v4 images are handled",
+            ));
+        }
+    } else {
+        if version < 3 {
+            return Err(fail(
+                IMAGE,
+                "image parsing",
+                label,
+                format!("boot header version {version} is a legacy format (v0/v1/v2)"),
+                "KernelSU's module loading relies on the GKI ramdisk layout, which only \
+                 exists from boot header v3 upward (Android 11+ / kernel 5.10+). This device \
+                 is not supported by the module-based install",
+            ));
+        }
+        if version > 4 {
+            return Err(fail(
+                IMAGE,
+                "image parsing",
+                label,
+                format!("boot header version {version} is newer than this build understands"),
+                "update the tool",
+            ));
+        }
     }
 
     let header = image.get_header();
-    if image.get_blocks().get_ramdisk().is_none() {
+    let ramdisk_block = image.get_blocks().get_ramdisk();
+    if ramdisk_block.is_none() {
         return Err(fail(
             IMAGE,
             "image parsing",
             label,
             "the image has no ramdisk section, so there is nowhere to install the module",
-            "on Android 13+ the ramdisk lives in init_boot.img -- patch that instead of boot.img",
+            if is_vendor {
+                "this vendor_boot carries no vendor ramdisk; patch the image that has one"
+            } else {
+                "on Android 13+ the ramdisk lives in init_boot.img, and on some 5.10 devices \
+                 in vendor_boot.img -- patch that instead of boot.img"
+            },
         ));
     }
 
     let mut kernel_plain = Vec::new();
+    let mut kernel_error = None;
     let kernel = match image.get_blocks().get_kernel() {
         Some(k) => {
-            k.dump(&mut kernel_plain, false).map_err(|e| {
-                fail(
-                    IMAGE,
-                    "kernel decompression",
-                    label,
-                    format!("cannot decompress the kernel section: {e}"),
-                    "the image may be truncated or corrupt",
-                )
-            })?;
+            // Only the ramdisk is modified, so an unreadable kernel must not stop a patch:
+            // it only removes one source of KMI evidence. Keep the reason and carry on.
+            let plain_len = match k.dump(&mut kernel_plain, false) {
+                Ok(()) => Some(kernel_plain.len()),
+                Err(e) => {
+                    kernel_error = Some(format!("{e}"));
+                    kernel_plain.clear();
+                    None
+                }
+            };
             Some(BlockInfo {
                 stored_len: k.get_data().len(),
-                plain_len: Some(kernel_plain.len()),
+                plain_len,
                 format: format!("{:?}", k.get_compress_format()),
             })
         }
         None => None,
     };
 
-    let ramdisk = image.get_blocks().get_ramdisk().map(|r| {
-        let mut plain = Vec::new();
-        let plain_len = r.dump(&mut plain, false).ok().map(|_| plain.len());
-        BlockInfo {
-            stored_len: r.get_data().len(),
-            plain_len,
-            format: format!("{:?}", r.get_compress_format()),
+    let mut ramdisk_fragments: Vec<(String, usize)> = Vec::new();
+    let mut ramdisk_name = None;
+    if let Some(r) = ramdisk_block {
+        if r.is_vendor_ramdisk() {
+            for e in r.iter_vendor_ramdisk() {
+                ramdisk_fragments.push((
+                    String::from_utf8_lossy(e.get_name_raw()).into_owned(),
+                    e.get_data().len(),
+                ));
+            }
+            if pick_vendor_entry(r).is_none() {
+                return Err(fail(
+                    IMAGE,
+                    "vendor ramdisk",
+                    label,
+                    "the vendor ramdisk table has no `init_boot` and no unnamed fragment",
+                    format!(
+                        "fragments present: {}",
+                        ramdisk_fragments
+                            .iter()
+                            .map(|(name, _)| name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                ));
+            }
+        }
+    }
+    let ramdisk = ramdisk_block.map(|r| {
+        if r.is_vendor_ramdisk() {
+            let index = pick_vendor_entry(r).expect("checked above");
+            let entry = r
+                .get_vendor_ramdisk(index)
+                .expect("index from pick_vendor_entry");
+            ramdisk_name = Some(String::from_utf8_lossy(entry.get_name_raw()).into_owned());
+            let mut plain = Vec::new();
+            let plain_len = entry.dump(&mut plain, false).ok().map(|_| plain.len());
+            BlockInfo {
+                stored_len: entry.get_data().len(),
+                plain_len,
+                format: format!("{:?}", entry.get_compress_format()),
+            }
+        } else {
+            let mut plain = Vec::new();
+            let plain_len = r.dump(&mut plain, false).ok().map(|_| plain.len());
+            BlockInfo {
+                stored_len: r.get_data().len(),
+                plain_len,
+                format: format!("{:?}", r.get_compress_format()),
+            }
         }
     });
 
@@ -214,10 +387,22 @@ pub fn inspect(data: &[u8], label: &str) -> Res<ImageInfo> {
     let mut extra_blocks: Vec<(&'static str, usize)> = Vec::new();
     for (name, has, size) in [
         ("second", header.has_second_size(), header.get_second_size()),
-        ("recovery_dtbo", header.has_recovery_dtbo_size(), header.get_recovery_dtbo_size()),
+        (
+            "recovery_dtbo",
+            header.has_recovery_dtbo_size(),
+            header.get_recovery_dtbo_size(),
+        ),
         ("dtb", header.has_dtb_size(), header.get_dtb_size()),
-        ("signature", header.has_signature_size(), header.get_signature_size()),
-        ("bootconfig", header.has_bootconfig_size(), header.get_bootconfig_size()),
+        (
+            "signature",
+            header.has_signature_size(),
+            header.get_signature_size(),
+        ),
+        (
+            "bootconfig",
+            header.has_bootconfig_size(),
+            header.get_bootconfig_size(),
+        ),
     ] {
         if has && size > 0 {
             extra_blocks.push((name, size as usize));
@@ -225,7 +410,24 @@ pub fn inspect(data: &[u8], label: &str) -> Res<ImageInfo> {
     }
 
     // init_boot has no kernel section at all: it exists precisely to carry the ramdisk.
-    let kind = if kernel.is_some() { "boot" } else { "init_boot" };
+    let kind = if is_vendor {
+        "vendor_boot"
+    } else if kernel.is_some() {
+        "boot"
+    } else {
+        "init_boot"
+    };
+
+    let (arch, kernel_release, kmi) = if kernel_error.is_some() {
+        // `dump` may have written a prefix before failing; that prefix is not evidence.
+        (None, None, None)
+    } else {
+        (
+            detect_arch(&kernel_plain),
+            detect_release(&kernel_plain),
+            detect_kmi(&kernel_plain),
+        )
+    };
 
     Ok(ImageInfo {
         kind,
@@ -235,10 +437,31 @@ pub fn inspect(data: &[u8], label: &str) -> Res<ImageInfo> {
         kernel,
         ramdisk,
         extra_blocks,
-        arch: detect_arch(&kernel_plain),
-        kernel_release: detect_release(&kernel_plain),
-        kmi: detect_kmi(&kernel_plain),
+        arch,
+        kernel_release,
+        kmi,
+        kernel_error,
+        ramdisk_fragments,
+        ramdisk_name,
     })
+}
+
+/// Which entry of a vendor_boot v4 ramdisk table holds the generic ramdisk.
+///
+/// The GKI convention names it `init_boot`; older tools leave the name empty. Anything
+/// else is a vendor-specific fragment and must not be replaced.
+fn pick_vendor_entry(ramdisk: &android_bootimg::parser::RamdiskImage<'_>) -> Option<usize> {
+    let mut unnamed = None;
+    for (index, entry) in ramdisk.iter_vendor_ramdisk().enumerate() {
+        let name = entry.get_name_raw();
+        if name == b"init_boot" {
+            return Some(index);
+        }
+        if name.is_empty() {
+            unnamed = Some(index);
+        }
+    }
+    unnamed
 }
 
 /// Architecture of the payload the ramdisk expects, read from its `init` binary when that
@@ -289,15 +512,31 @@ pub fn detect_arch(kernel: &[u8]) -> Option<&'static str> {
 /// The kernel release string (`5.10.198-android13-8-g...`), read from the version banner.
 pub fn detect_release(kernel: &[u8]) -> Option<String> {
     const NEEDLE: &[u8] = b"Linux version ";
-    let at = find(kernel, NEEDLE)? + NEEDLE.len();
-    let end = kernel[at..]
-        .iter()
-        .position(|&c| c == b' ' || c == 0)
-        .unwrap_or(0);
-    if end == 0 {
-        return None;
+    // The first hit is not necessarily the banner: printk format strings such as
+    // `Linux version %s ...` live in .rodata too. Only accept a token that starts with a
+    // digit and contains no format specifier.
+    let mut from = 0usize;
+    while let Some(rel) = find(&kernel[from..], NEEDLE) {
+        let at = from + rel + NEEDLE.len();
+        from = at;
+        let end = kernel[at..]
+            .iter()
+            .position(|&c| c == b' ' || c == 0)
+            .unwrap_or(0);
+        if end == 0 {
+            continue;
+        }
+        let candidate = String::from_utf8_lossy(&kernel[at..at + end]).into_owned();
+        if candidate
+            .as_bytes()
+            .first()
+            .is_some_and(|c| c.is_ascii_digit())
+            && !candidate.contains('%')
+        {
+            return Some(candidate);
+        }
     }
-    Some(String::from_utf8_lossy(&kernel[at..at + end]).into_owned())
+    None
 }
 
 /// KMI (`android13-5.10`) from the kernel bytes.
@@ -408,7 +647,11 @@ pub fn android_release(cpio: &Cpio) -> Option<String> {
         b"ro.system.build.version.release=",
     ];
     for (name, entry) in cpio.entries() {
-        if !name.ends_with(".prop") {
+        // GKI ramdisks carry `prop.default` at the root, and some vendors a
+        // `system/etc/ramdisk/build.prop`; both are real property files even though only
+        // the latter ends in `.prop`.
+        let is_prop = name.ends_with(".prop") || name.ends_with("prop.default");
+        if !is_prop {
             continue;
         }
         let Some(data) = entry.data() else { continue };
@@ -445,7 +688,9 @@ pub fn kernel_xy_from_ramdisk(cpio: &Cpio) -> Option<(String, String)> {
         let Some(info) = crate::elf::ElfInfo::parse(data) else {
             continue;
         };
-        let Some(vm) = crate::elf::vermagic(data, &info) else { continue };
+        let Some(vm) = crate::elf::vermagic(data, &info) else {
+            continue;
+        };
         if let Some(xy) = crate::elf::kernel_xy(&vm) {
             return Some((xy, name.clone()));
         }
@@ -453,70 +698,184 @@ pub fn kernel_xy_from_ramdisk(cpio: &Cpio) -> Option<(String, String)> {
     None
 }
 
-/// Architecture and KMI of the kernel inside another image.
+/// Architecture, KMI and kernel release of the kernel inside another image.
 ///
 /// The architecture matters: a firmware folder can hold images for more than one device,
-/// and picking up the wrong one would install a module built for a different kernel.
-pub fn kernel_facts_from_image(data: &[u8]) -> Option<(&'static str, Option<String>)> {
-    let image = BootImage::parse(data).ok()?;
+/// and picking up the wrong one would install a module built for a different kernel. The
+/// release is returned even when the banner names no Android branch, so `init_boot.img`
+/// can still resolve the KMI from the sibling `boot.img` plus the ramdisk's `build.prop`.
+pub fn kernel_facts_from_image(
+    data: &[u8],
+) -> Option<(&'static str, Option<String>, Option<String>)> {
+    let image = parse_checked(data, "kernel image").ok()?;
     let kernel = image.get_blocks().get_kernel()?;
     let mut plain = Vec::new();
     kernel.dump(&mut plain, false).ok()?;
-    Some((detect_arch(&plain)?, detect_kmi(&plain)))
+    Some((
+        detect_arch(&plain)?,
+        detect_kmi(&plain),
+        detect_release(&plain),
+    ))
 }
 
-/// KMI read from the kernel inside another image (a `boot.img`, typically).
+/// Extract the ramdisk as a cpio archive, and say where it has to go back.
 ///
-/// This is the offline answer for a *pristine* init_boot: the kernel is not in that
-/// partition, but the sibling boot image from the same firmware has it.
-pub fn kmi_from_image(data: &[u8]) -> Option<String> {
-    let image = BootImage::parse(data).ok()?;
-    let kernel = image.get_blocks().get_kernel()?;
-    let mut plain = Vec::new();
-    kernel.dump(&mut plain, false).ok()?;
-    detect_kmi(&plain)
-}
-
-/// Extract the ramdisk as a cpio archive.
-pub fn load_ramdisk_cpio(data: &[u8], label: &str) -> Res<Cpio> {
-    let image = BootImage::parse(data).map_err(|e| {
-        fail(
-            IMAGE,
-            "image parsing",
-            label,
-            format!("{e}"),
-            "unexpected; re-run the tool",
-        )
-    })?;
+/// A `vendor_boot` v4 image concatenates several fragments and describes them in a table;
+/// only the `init_boot` (or unnamed) fragment holds the generic ramdisk, and replacing any
+/// other one would corrupt a vendor-specific ramdisk.
+pub fn load_ramdisk_cpio(data: &[u8], label: &str) -> Res<(Cpio, RamdiskTarget)> {
+    let image = parse_checked(data, label)?;
+    let vendor = matches!(
+        image.get_header().get_version(),
+        BootImageVersion::Vendor(_)
+    );
     let ramdisk = image.get_blocks().get_ramdisk().ok_or_else(|| {
         fail(
             IMAGE,
             "ramdisk extraction",
             label,
             "no ramdisk section",
-            "patch init_boot.img instead of boot.img",
+            if vendor {
+                "this vendor_boot carries no vendor ramdisk"
+            } else {
+                "patch init_boot.img rather than a boot.img that has no ramdisk"
+            },
         )
     })?;
-    let format = format!("{:?}", ramdisk.get_compress_format());
-    let mut plain = Vec::new();
-    ramdisk.dump(&mut plain, false).map_err(|e| {
-        fail(
-            IMAGE,
-            "ramdisk decompression",
-            label,
-            format!("cannot decompress the ramdisk (stored format {format}): {e}"),
-            "the image may be truncated or corrupt",
-        )
-    })?;
-    Cpio::load_from_data(&plain).map_err(|e| {
-        fail(
-            IMAGE,
-            "ramdisk cpio",
-            label,
-            format!("ramdisk does not contain a readable cpio archive: {e}"),
-            "this build handles the cpio formats repacking tools produce; a vendor variant may be unsupported",
-        )
-    })
+
+    let (target, plain, _format) = if ramdisk.is_vendor_ramdisk() {
+        let index = pick_vendor_entry(ramdisk).ok_or_else(|| {
+            fail(
+                IMAGE,
+                "vendor ramdisk",
+                label,
+                "the vendor ramdisk table has no `init_boot` and no unnamed fragment",
+                "this vendor_boot layout is not one KernelSU installs into",
+            )
+        })?;
+        let entry = ramdisk
+            .get_vendor_ramdisk(index)
+            .expect("index from pick_vendor_entry");
+        let name = String::from_utf8_lossy(entry.get_name_raw()).into_owned();
+        let format = format!("{:?}", entry.get_compress_format());
+        let mut plain = Vec::new();
+        entry.dump(&mut plain, false).map_err(|e| {
+            fail(
+                IMAGE,
+                "ramdisk decompression",
+                label,
+                format!("cannot decompress vendor ramdisk `{name}` (stored format {format}): {e}"),
+                "the image may be truncated or corrupt",
+            )
+        })?;
+        (RamdiskTarget::VendorEntry { index }, plain, format)
+    } else {
+        let format = format!("{:?}", ramdisk.get_compress_format());
+        let mut plain = Vec::new();
+        ramdisk.dump(&mut plain, false).map_err(|e| {
+            fail(
+                IMAGE,
+                "ramdisk decompression",
+                label,
+                format!("cannot decompress the ramdisk (stored format {format}): {e}"),
+                "the image may be truncated or corrupt",
+            )
+        })?;
+        let target = if vendor {
+            RamdiskTarget::VendorWhole
+        } else {
+            RamdiskTarget::Boot
+        };
+        (target, plain, format)
+    };
+
+    let cpio = validate_cpio(&plain)
+        .and_then(|()| {
+            Cpio::load_from_data(&plain).map_err(|e| format!("{e}"))
+        })
+        .map_err(|e| {
+            fail(
+                IMAGE,
+                "ramdisk cpio",
+                label,
+                format!("ramdisk does not contain a readable cpio archive: {e}"),
+                "this build handles the cpio formats repacking tools produce; a vendor variant may be unsupported",
+            )
+        })?;
+    Ok((cpio, target))
+}
+
+/// Validate the newc/crc CPIO framing before handing it to `android-bootimg`.
+///
+/// That crate aligns past `TRAILER!!!` without checking the result and can panic on a
+/// malformed archive. This walk is deliberately conservative: it only rejects archives
+/// whose headers, sizes or trailer violate the format, so valid images still reach the
+/// dependency unchanged.
+fn validate_cpio(data: &[u8]) -> Result<(), String> {
+    if data.len() < 6 || (!data.starts_with(b"070701") && !data.starts_with(b"070702")) {
+        return Ok(());
+    }
+    let align4 = |n: usize| n.checked_add(3).map(|v| v & !3);
+    let field = |off: usize| -> Result<usize, String> {
+        let bytes = data
+            .get(off..off + 8)
+            .ok_or_else(|| "truncated cpio header".to_string())?;
+        let text = std::str::from_utf8(bytes).map_err(|_| "non-ASCII cpio header".to_string())?;
+        usize::from_str_radix(text, 16).map_err(|_| "invalid cpio header field".to_string())
+    };
+
+    let mut off = 0usize;
+    for _ in 0..=data.len() / 110 {
+        let header = data
+            .get(off..off + 110)
+            .ok_or_else(|| "truncated cpio header".to_string())?;
+        if !header.starts_with(b"070701") && !header.starts_with(b"070702") {
+            return Err("cpio entry has an invalid magic".to_string());
+        }
+        let namesize = field(off + 94)?;
+        let filesize = field(off + 54)?;
+        if namesize == 0 {
+            return Err("cpio entry has an empty name".to_string());
+        }
+        let name_start = off + 110;
+        let name_end = name_start
+            .checked_add(namesize)
+            .ok_or_else(|| "cpio name size overflows".to_string())?;
+        let name = data
+            .get(name_start..name_end)
+            .ok_or_else(|| "truncated cpio entry name".to_string())?;
+        let name = name.strip_suffix(&[0]).unwrap_or(name);
+        let data_start = align4(name_end).ok_or_else(|| "cpio offset overflows".to_string())?;
+        let data_end = data_start
+            .checked_add(filesize)
+            .ok_or_else(|| "cpio file size overflows".to_string())?;
+        if data_end > data.len() {
+            return Err("cpio entry payload runs past end of archive".to_string());
+        }
+        if name == b"TRAILER!!!" {
+            let mut next = align4(data_end).ok_or_else(|| "cpio offset overflows".to_string())?;
+            if next > data.len() {
+                return Err("cpio trailer alignment runs past end of archive".to_string());
+            }
+            while next < data.len() && data[next] == 0 {
+                next += 1;
+            }
+            if next == data.len() {
+                return Ok(());
+            }
+            if data[next..].starts_with(b"070701") || data[next..].starts_with(b"070702") {
+                // Concatenated archives are legal; keep validating the next one.
+                off = next;
+                continue;
+            }
+            return Err("unexpected data after cpio trailer".to_string());
+        }
+        off = align4(data_end).ok_or_else(|| "cpio offset overflows".to_string())?;
+        if off >= data.len() {
+            break;
+        }
+    }
+    Err("cpio archive has no TRAILER!!! record".to_string())
 }
 
 /// Name the stock-image checksum is recorded under when an install backs it up.
@@ -524,6 +883,9 @@ pub const STOCK_SHA1_NAME: &str = "stock_image.sha1";
 
 pub struct InjectOptions<'a> {
     pub module: &'a [u8],
+    /// Filename the manager's init expects, normally `kernelsu.ko`; 7kimisu uses
+    /// `sevenk.ko`.
+    pub module_name: &'a str,
     pub ksuinit: &'a [u8],
     /// Contents of `ksu_config`, or `None` to leave the file out entirely.
     ///
@@ -566,7 +928,7 @@ pub fn inject(cpio: &mut Cpio, opts: &InjectOptions, label: &str) -> Res<Injecti
         ));
     }
 
-    let upgrade = cpio.exists(MODULE_NAME);
+    let upgrade = cpio.exists(opts.module_name);
     let mut renamed_init = false;
     let mut missing_init = false;
 
@@ -603,7 +965,7 @@ pub fn inject(cpio: &mut Cpio, opts: &InjectOptions, label: &str) -> Res<Injecti
         )
     })?;
     cpio.add(
-        MODULE_NAME,
+        opts.module_name,
         CpioEntry::regular(MODULE_MODE, Box::new(opts.module.to_vec())),
     )
     .map_err(|e| {
@@ -611,7 +973,7 @@ pub fn inject(cpio: &mut Cpio, opts: &InjectOptions, label: &str) -> Res<Injecti
             INJECT,
             "ramdisk injection",
             label,
-            format!("cannot install `{MODULE_NAME}`: {e}"),
+            format!("cannot install `{}`: {e}", opts.module_name),
             "report this image",
         )
     })?;
@@ -665,7 +1027,7 @@ pub fn inject(cpio: &mut Cpio, opts: &InjectOptions, label: &str) -> Res<Injecti
 
 /// Serialise the cpio and rebuild the image, re-compressing the ramdisk with the format it
 /// originally used.
-pub fn repack(image_data: &[u8], cpio: &Cpio, label: &str) -> Res<Vec<u8>> {
+pub fn repack(image_data: &[u8], cpio: &Cpio, target: &RamdiskTarget, label: &str) -> Res<Vec<u8>> {
     let mut new_ramdisk = Vec::new();
     cpio.dump(&mut new_ramdisk).map_err(|e| {
         fail(
@@ -677,19 +1039,18 @@ pub fn repack(image_data: &[u8], cpio: &Cpio, label: &str) -> Res<Vec<u8>> {
         )
     })?;
 
-    let image = BootImage::parse(image_data).map_err(|e| {
-        fail(
-            IMAGE,
-            "image parsing",
-            label,
-            format!("{e}"),
-            "unexpected; re-run the tool",
-        )
-    })?;
+    let image = parse_checked(image_data, label)?;
     let mut patcher = BootImagePatchOption::new(&image);
     // `false` means "this payload is already uncompressed, please re-compress it the way
     // the original ramdisk was" -- which is what keeps the bootloader happy.
-    patcher.replace_ramdisk(Box::new(Cursor::new(new_ramdisk)), false);
+    match target {
+        RamdiskTarget::VendorEntry { index } => {
+            patcher.replace_vendor_ramdisk(*index, Box::new(Cursor::new(new_ramdisk)), false);
+        }
+        RamdiskTarget::Boot | RamdiskTarget::VendorWhole => {
+            patcher.replace_ramdisk(Box::new(Cursor::new(new_ramdisk)), false);
+        }
+    }
 
     let mut out = Cursor::new(Vec::with_capacity(image.get_size() + 64 * 1024));
     patcher.patch(&mut out).map_err(|e| {
@@ -713,39 +1074,125 @@ pub struct Verified {
     pub version: u32,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{detect_release, parse_checked, validate_cpio, BOOT_MAGIC, VENDOR_BOOT_MAGIC};
+
+    #[test]
+    fn release_skips_printk_format_strings() {
+        // The real banner is the second hit; the first is the printk format string that
+        // lives in .rodata next to it.
+        let kernel = b"...Linux version %s (buildd@host) ...\0\
+                       ....Linux version 5.10.240-android12-9-g6b9462777a8b SMP PREEMPT\0";
+        assert_eq!(
+            detect_release(kernel).as_deref(),
+            Some("5.10.240-android12-9-g6b9462777a8b")
+        );
+    }
+
+    #[test]
+    fn truncated_boot_header_is_rejected() {
+        let mut data = vec![0u8; 1024];
+        data[..8].copy_from_slice(BOOT_MAGIC);
+        data[40..44].copy_from_slice(&3u32.to_le_bytes());
+        assert!(parse_checked(&data, "test").is_err());
+    }
+
+    #[test]
+    fn truncated_vendor_header_is_rejected() {
+        let mut data = vec![0u8; 1024];
+        data[..8].copy_from_slice(VENDOR_BOOT_MAGIC);
+        data[8..12].copy_from_slice(&4u32.to_le_bytes());
+        assert!(parse_checked(&data, "test").is_err());
+    }
+
+    #[test]
+    fn invalid_vendor_page_size_is_rejected() {
+        let mut data = vec![0u8; 2128];
+        data[..8].copy_from_slice(VENDOR_BOOT_MAGIC);
+        data[8..12].copy_from_slice(&4u32.to_le_bytes());
+        data[12..16].copy_from_slice(&3000u32.to_le_bytes());
+        assert!(parse_checked(&data, "test").is_err());
+    }
+
+    fn trailer_only_cpio(padding: usize) -> Vec<u8> {
+        let name = b"TRAILER!!!\0";
+        let mut header = [b'0'; 110];
+        header[..6].copy_from_slice(b"070701");
+        header[54..62].copy_from_slice(b"00000000");
+        header[94..102].copy_from_slice(format!("{:08X}", name.len()).as_bytes());
+        let mut data = header.to_vec();
+        data.extend_from_slice(name);
+        data.resize(data.len() + padding, 0);
+        data
+    }
+
+    #[test]
+    fn cpio_trailer_alignment_is_checked() {
+        assert!(validate_cpio(&trailer_only_cpio(3)).is_ok());
+        assert!(validate_cpio(&trailer_only_cpio(2)).is_err());
+        let mut double = trailer_only_cpio(3);
+        let second = trailer_only_cpio(2);
+        double.extend_from_slice(&second);
+        assert!(validate_cpio(&double).is_err());
+    }
+}
+
+/// What the verifier must find in the produced image.
+pub struct VerifyOptions<'a> {
+    pub module_name: &'a str,
+    pub module: &'a [u8],
+    pub init: &'a [u8],
+    /// A fresh/upgraded install must have moved the original init to `init.real`.
+    pub require_init_real: bool,
+}
+
 /// Re-read the produced image and assert the install is really there.
-pub fn verify(data: &[u8], label: &str) -> Res<Verified> {
-    let cpio = load_ramdisk_cpio(data, label)?;
-    let image = BootImage::parse(data).map_err(|e| {
-        fail(
-            IMAGE,
-            "verification",
-            label,
-            format!("{e}"),
-            "report this defect",
-        )
-    })?;
+pub fn verify(data: &[u8], label: &str, opts: &VerifyOptions) -> Res<Verified> {
+    let (cpio, _) = load_ramdisk_cpio(data, label)?;
+    let image = parse_checked(data, label)?;
     let version = match image.get_header().get_version() {
         BootImageVersion::Android(v) => v,
+        BootImageVersion::Vendor(v) => v,
         _ => 0,
     };
 
-    let module = cpio.entry_by_name(MODULE_NAME).ok_or_else(|| {
+    let module = cpio.entry_by_name(opts.module_name).ok_or_else(|| {
         fail(
             ASSET,
             "verification",
             label,
-            format!("`{MODULE_NAME}` is missing from the produced image"),
+            format!("`{}` is missing from the produced image", opts.module_name),
             "report this defect",
         )
     })?;
-    let module_len = module.data().map(<[u8]>::len).unwrap_or(0);
-    if module_len == 0 {
+    let module_data = module.data().ok_or_else(|| {
+        fail(
+            ASSET,
+            "verification",
+            label,
+            format!("`{}` has no payload", opts.module_name),
+            "report this defect",
+        )
+    })?;
+    if module_data.is_empty() {
         return Err(fail(
             ASSET,
             "verification",
             label,
-            format!("`{MODULE_NAME}` is present but empty"),
+            format!("`{}` is present but empty", opts.module_name),
+            "report this defect",
+        ));
+    }
+    if module_data != opts.module {
+        return Err(fail(
+            ASSET,
+            "verification",
+            label,
+            format!(
+                "`{}` bytes differ from the payload selected for installation",
+                opts.module_name
+            ),
             "report this defect",
         ));
     }
@@ -758,11 +1205,37 @@ pub fn verify(data: &[u8], label: &str) -> Res<Verified> {
             "report this defect",
         )
     })?;
-    let init_len = init.data().map(<[u8]>::len).unwrap_or(0);
+    let init_data = init.data().ok_or_else(|| {
+        fail(
+            ASSET,
+            "verification",
+            label,
+            format!("`{INIT_NAME}` has no payload"),
+            "report this defect",
+        )
+    })?;
+    if init_data != opts.init {
+        return Err(fail(
+            ASSET,
+            "verification",
+            label,
+            format!("`{INIT_NAME}` bytes differ from the ksuinit selected for installation"),
+            "report this defect",
+        ));
+    }
+    if opts.require_init_real && !cpio.exists(INIT_REAL_NAME) {
+        return Err(fail(
+            ASSET,
+            "verification",
+            label,
+            format!("`{INIT_REAL_NAME}` is missing; the original init was not preserved"),
+            "the ramdisk has no usable init to chain from; do not flash this image",
+        ));
+    }
 
     Ok(Verified {
-        module_len,
-        init_len,
+        module_len: module_data.len(),
+        init_len: init_data.len(),
         init_real: cpio.exists(INIT_REAL_NAME),
         config: cpio
             .entry_by_name(CONFIG_NAME)

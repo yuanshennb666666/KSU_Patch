@@ -19,11 +19,20 @@ pub const MAX_ASSET: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
-    /// ET_REL object: a loadable kernel module.
+    /// ET_REL object whose module name is `kernelsu`: the payload this tool installs.
     Module,
+    /// Any other ET_REL object bundled by a fork (e.g. KernelSU-Next's
+    /// `susfs_guard_lkm`). It shares the ramdisk with the payload but is not the module
+    /// that a KMI selects, so it must not take part in KMI resolution.
+    AuxModule,
     KsuInit,
     BusyBox,
     Bootctl,
+    /// `waitsys`, the binder-wait helper added in KernelSU 3.3.1.
+    Waitsys,
+    /// A fork-specific ELF helper bundled next to the payload (mkbootfs, xecinit, ...).
+    /// It is carried through untouched and is not part of the KMI selection.
+    Helper,
     Unknown,
 }
 
@@ -36,6 +45,8 @@ pub struct Asset {
     pub data: Vec<u8>,
     pub elf: Option<ElfInfo>,
     pub kind: Kind,
+    /// `name=` from the module's `.modinfo`, for ET_REL objects.
+    pub module_name: Option<String>,
     pub vermagic: Option<String>,
     pub ddk_kmi: Option<String>,
     pub clang: Option<String>,
@@ -46,13 +57,27 @@ pub struct Asset {
 }
 
 impl Asset {
-    pub fn identity(&self) -> &'static str {
+    pub fn identity(&self) -> String {
         match self.kind {
-            Kind::Module => "kernelsu.ko",
-            Kind::KsuInit => "ksuinit",
-            Kind::BusyBox => "busybox",
-            Kind::Bootctl => "bootctl",
-            Kind::Unknown => "(unrecognised)",
+            Kind::Module => "kernelsu.ko".to_string(),
+            Kind::AuxModule => match self.module_name.as_deref() {
+                Some(name) if !name.is_empty() => format!("{name}.ko"),
+                _ => "auxiliary .ko".to_string(),
+            },
+            Kind::KsuInit => "ksuinit".to_string(),
+            Kind::BusyBox => "busybox".to_string(),
+            Kind::Bootctl => "bootctl".to_string(),
+            Kind::Waitsys => "waitsys".to_string(),
+            Kind::Helper => {
+                if elf::contains(&self.data, b"mkbootfs") {
+                    "mkbootfs".to_string()
+                } else if elf::contains(&self.data, b"xecinit") {
+                    "xecinit".to_string()
+                } else {
+                    "helper binary".to_string()
+                }
+            }
+            Kind::Unknown => "(unrecognised)".to_string(),
         }
     }
 
@@ -130,20 +155,32 @@ fn build(offset: usize, csize: usize, data: Vec<u8>) -> Asset {
         data,
         elf,
         kind: Kind::Unknown,
+        module_name: None,
         vermagic: None,
         ddk_kmi: None,
         clang: None,
         kmi: None,
         evidence: Vec::new(),
     };
-    match elf {
-        Some(i) if i.etype == elf::ET_REL => {
-            asset.kind = Kind::Module;
+    if let Some(i) = elf {
+        if i.etype == elf::ET_REL {
+            let modinfo = elf::modinfo(&asset.data, &i);
+            asset.module_name = modinfo
+                .iter()
+                .find(|(key, _)| key == "name")
+                .map(|(_, value)| value.clone());
             asset.vermagic = elf::vermagic(&asset.data, &i);
             asset.ddk_kmi = elf::ddk_kmi(&asset.data);
             asset.clang = elf::clang_version(&asset.data);
-        }
-        _ => {
+            // Forks bundle extra modules next to the payload (KernelSU-Next ships a
+            // `susfs_guard_lkm` for every KMI). Only `kernelsu` is what a KMI selects;
+            // anything else is carried through untouched and reported separately. A
+            // module with no `name=` at all predates the field, so treat it as payload.
+            asset.kind = match asset.module_name.as_deref() {
+                Some("kernelsu") | None => Kind::Module,
+                Some(_) => Kind::AuxModule,
+            };
+        } else {
             asset.kind = if elf::contains(&asset.data, b"BusyBox")
                 && elf::contains(&asset.data, b"multi-call")
             {
@@ -156,10 +193,17 @@ fn build(offset: usize, csize: usize, data: Vec<u8>) -> Asset {
                 && elf::contains(&asset.data, b"init.real")
             {
                 Kind::KsuInit
+            } else if elf::contains(&asset.data, b"ksud-waitsys") {
+                Kind::Waitsys
             } else {
-                Kind::Unknown
+                // ET_EXEC/ET_DYN objects that are none of the known tools are fork
+                // helpers (ReSukiSU ships mkbootfs, XECKernelPro its xecinit). They are
+                // reported but never installed or matched to a KMI.
+                Kind::Helper
             };
         }
+    } else {
+        asset.kind = Kind::Unknown;
     }
     asset
 }
@@ -189,35 +233,49 @@ fn is_kmi_name(b: &[u8]) -> bool {
 }
 
 /// The KMI names this APK was built with. They appear verbatim as
-/// `<androidNN>-<major>.<minor>_kernelsu.ko` in the embedded asset name table, and that
-/// table is one concatenated run, so the name has to be recovered by looking strictly
-/// backwards from the suffix and validating the shape -- walking back over "name" bytes
-/// alone would run straight through the neighbouring names.
+/// `<androidNN>-<major>.<minor>_kernelsu.ko` (or `_sevenk.ko` in 7kimisu) in the embedded
+/// asset name table, and that table is one concatenated run, so the name has to be recovered
+/// by looking strictly backwards from the suffix and validating the shape -- walking back over
+/// "name" bytes alone would run straight through the neighbouring names.
 pub fn supported_kmi(lib: &[u8]) -> Vec<String> {
-    const SUFFIX: &[u8] = b"_kernelsu.ko";
+    const SUFFIXES: [&[u8]; 2] = [b"_kernelsu.ko", b"_sevenk.ko"];
     /// Longest plausible KMI name (`android17-6.18`); a bound keeps the window small.
     const WINDOW: usize = 32;
     let mut out: Vec<String> = Vec::new();
-    let mut search = 0usize;
-    while let Some(rel) = elf::find(&lib[search..], SUFFIX) {
-        let at = search + rel;
-        search = at + SUFFIX.len();
-        let win_from = at.saturating_sub(WINDOW);
-        let win = &lib[win_from..at];
-        // Longest suffix of the window that is a valid KMI name and ends right here.
-        for len in (1..=win.len()).rev() {
-            let cand = &win[win.len() - len..];
-            if is_kmi_name(cand) {
-                let kmi = String::from_utf8_lossy(cand).into_owned();
-                if !out.contains(&kmi) {
-                    out.push(kmi);
+    for suffix in SUFFIXES {
+        let mut search = 0usize;
+        while let Some(rel) = elf::find(&lib[search..], suffix) {
+            let at = search + rel;
+            search = at + suffix.len();
+            let win_from = at.saturating_sub(WINDOW);
+            let win = &lib[win_from..at];
+            // Longest suffix of the window that is a valid KMI name and ends right here.
+            for len in (1..=win.len()).rev() {
+                let cand = &win[win.len() - len..];
+                if is_kmi_name(cand) {
+                    let kmi = String::from_utf8_lossy(cand).into_owned();
+                    if !out.contains(&kmi) {
+                        out.push(kmi);
+                    }
+                    break;
                 }
-                break;
             }
         }
     }
     out.sort();
     out
+}
+
+/// Filename the manager's init expects for the module inside the ramdisk.
+///
+/// KernelSU and most forks install `kernelsu.ko`; 7kimisu installs `sevenk.ko` and its
+/// ksuinit looks for exactly that name.
+pub fn module_file_name(lib: &[u8]) -> &'static str {
+    if elf::find(lib, b"_sevenk.ko").is_some() {
+        "sevenk.ko"
+    } else {
+        crate::boot::MODULE_NAME
+    }
 }
 
 /// (Android release, clang version) pairs a module states about itself: the DDK build path

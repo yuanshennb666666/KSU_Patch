@@ -1,9 +1,10 @@
-//! Attaches the KernelSU icon to the executable.
+//! Attaches the KernelSU icon to the executable when `KSUPATCH_ICON` is set.
 //!
 //! Windows takes an executable's icon from its resource section, so a small `.res` has to be
 //! compiled and handed to the linker. `llvm-rc` (or `windres`) comes with the mingw-w64
-//! toolchain, which avoids pulling in a build-dependency just for this. If neither tool is
-//! present the build still succeeds -- it simply produces an executable with the default icon.
+//! toolchain, which avoids pulling in a build-dependency just for this. The icon is opt-in
+//! because the resource costs about 6 KiB in the packed executable; without the variable the
+//! build simply produces an executable with the default icon.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -12,7 +13,32 @@ const ICON: &str = "assets/icon.ico";
 
 fn main() {
     println!("cargo:rerun-if-changed={ICON}");
+    println!("cargo:rerun-if-changed=assets/ksupatch.manifest");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=KSUPATCH_ICON");
+
+    // Explicitly declare asInvoker. Without a manifest Windows applies Installer
+    // Detection to 32-bit programs whose names contain words such as "patch", so
+    // an x86 build named ksupatch.exe would demand elevation before it even runs.
+    // The MSVC linker can embed a manifest directly; the gnullvm/zig path does
+    // not need it because Installer Detection only applies to 32-bit images.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
+    {
+        let manifest = PathBuf::from("assets/ksupatch.manifest");
+        if manifest.exists() {
+            println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
+            println!(
+                "cargo:rustc-link-arg=/MANIFESTINPUT:{}",
+                manifest.canonicalize().unwrap_or(manifest).display()
+            );
+        }
+    }
+
+    // Smallest default build: only embed the icon when explicitly requested.
+    if std::env::var_os("KSUPATCH_ICON").is_none() {
+        return;
+    }
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;

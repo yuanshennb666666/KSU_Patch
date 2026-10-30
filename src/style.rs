@@ -22,7 +22,12 @@ static ON: AtomicBool = AtomicBool::new(false);
 
 pub fn init(choice: Choice) -> Result<(), String> {
     let on = match choice {
-        Choice::Always => true,
+        Choice::Always => {
+            if std::io::stdout().is_terminal() {
+                let _ = enable_virtual_terminal();
+            }
+            true
+        }
         Choice::Never => false,
         Choice::Auto => {
             if std::env::var_os("NO_COLOR").is_some() {
@@ -56,11 +61,11 @@ pub fn bold(s: &str) -> String {
 pub fn dim(s: &str) -> String {
     wrap("2", s)
 }
-pub fn red(s: &str) -> String {
-    wrap("31", s)
+pub fn cyan(s: &str) -> String {
+    wrap("36", s)
 }
-pub fn dim_red(s: &str) -> String {
-    wrap("2;31", s)
+pub fn bold_cyan(s: &str) -> String {
+    wrap("1;36", s)
 }
 pub fn green(s: &str) -> String {
     wrap("32", s)
@@ -68,8 +73,8 @@ pub fn green(s: &str) -> String {
 pub fn yellow(s: &str) -> String {
     wrap("33", s)
 }
-pub fn heading(s: &str) -> String {
-    wrap("1;36", s)
+pub fn bold_yellow(s: &str) -> String {
+    wrap("1;33", s)
 }
 pub fn bold_green(s: &str) -> String {
     wrap("1;32", s)

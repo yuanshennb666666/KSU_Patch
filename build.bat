@@ -4,7 +4,10 @@ setlocal
 rem ============================================================================
 rem  Build ksupatch, then compress the result with UPX.
 rem
-rem  Usage:  build.bat
+rem  Usage:  build.bat [icon]
+rem
+rem  Pass "icon" to embed assets\icon.ico; the default build leaves it out so the
+rem  packed executable is as small as possible.
 rem
 rem  The first build downloads the Rust dependencies; later builds work offline
 rem  from the local cargo cache.
@@ -12,6 +15,8 @@ rem
 rem  This file is deliberately ASCII-only: a .bat with non-ASCII text is read in
 rem  the console code page and turns into garbage.
 rem ============================================================================
+
+if /i "%~1"=="icon" set "KSUPATCH_ICON=1"
 
 echo cargo build --release
 cargo build --release
@@ -31,8 +36,7 @@ if exist "tools\upx.exe" (
 )
 
 echo.
-for %%F in ("%EXE%") do echo built : %%~fF
-for %%F in ("%EXE%") do echo size  : %%~zF bytes
+powershell -NoProfile -Command "$f = Get-Item '%EXE%'; 'built  : ' + $f.FullName; 'size   : {0:N0} bytes ({1:N3} MiB)' -f $f.Length, ($f.Length / 1MB); 'sha256 : ' + (Get-FileHash $f.FullName -Algorithm SHA256).Hash.ToLower()"
 endlocal
 exit /b 0
 

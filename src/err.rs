@@ -39,25 +39,43 @@ pub fn fail(
     }
 }
 
-/// Renders a failure as a block, on stderr.
+/// Renders a failure on stderr.
 ///
-/// The whole block is red, frame included: an error block that frames itself in red but
-/// leaves its body uncoloured reads as two mismatched halves.
+/// The compact `label  value` form matches the rest of the output. Colours follow stderr's
+/// own terminal state rather than stdout's, so `2>err.log` never collects escape sequences
+/// even when the normal report is still going to a console.
 pub fn report(f: &Fail) {
     use crate::style;
-    let line = "-".repeat(72);
+    use std::io::IsTerminal;
+
+    let color = style::on() && std::io::stderr().is_terminal();
+    let paint = |f: fn(&str) -> String, s: &str| {
+        if color {
+            f(s)
+        } else {
+            s.to_string()
+        }
+    };
     eprintln!();
-    eprintln!("{}", style::red(&line));
-    eprintln!("{}", style::bold_red("ERROR"));
-    eprintln!("{}", style::red(&line));
-    eprintln!("  {} {}", style::dim_red("stage  :"), style::red(&f.stage));
-    eprintln!("  {} {}", style::dim_red("input  :"), style::red(&f.input));
-    eprintln!("  {} {}", style::dim_red("reason :"), style::bold_red(&f.reason));
-    eprintln!("  {} {}", style::dim_red("hint   :"), style::red(&f.hint));
     eprintln!(
-        "  {} {}",
-        style::dim_red("exit   :"),
-        style::red(&f.exit.to_string())
+        "{}  {}",
+        paint(style::bold_red, "ERROR"),
+        paint(style::bold, &f.stage)
     );
-    eprintln!("{}", style::red(&line));
+    eprintln!("  {:<7}  {}", paint(style::dim, "Input"), &f.input);
+    eprintln!(
+        "  {:<7}  {}",
+        paint(style::dim, "Cause"),
+        paint(style::bold_red, &f.reason)
+    );
+    eprintln!(
+        "  {:<7}  {}",
+        paint(style::dim, "Hint"),
+        paint(style::bold_yellow, &f.hint)
+    );
+    eprintln!(
+        "  {:<7}  {}",
+        paint(style::dim, "Exit"),
+        paint(style::dim, &f.exit.to_string())
+    );
 }

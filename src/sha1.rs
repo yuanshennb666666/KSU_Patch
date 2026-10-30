@@ -5,7 +5,13 @@
 //! enough to keep in-tree rather than pull another crate.
 
 pub fn hex(data: &[u8]) -> String {
-    let mut h: [u32; 5] = [0x6745_2301, 0xEFCD_AB89, 0x98BA_DCFE, 0x1032_5476, 0xC3D2_E1F0];
+    let mut h: [u32; 5] = [
+        0x6745_2301,
+        0xEFCD_AB89,
+        0x98BA_DCFE,
+        0x1032_5476,
+        0xC3D2_E1F0,
+    ];
 
     let bit_len = (data.len() as u64).wrapping_mul(8);
     let mut msg = data.to_vec();
@@ -77,6 +83,9 @@ mod tests {
         assert_eq!(hex(&[b'a'; 63]), "03f09f5b158a7a8cdad920bddc29b81c18a551f5");
         assert_eq!(hex(&[b'a'; 64]), "0098ba824b5c16427bd7a1122a5a442a25ec644d");
         assert_eq!(hex(&[b'a'; 65]), "11655326c708d70319be2610e8a57d9a5b959d3b");
-        assert_eq!(hex(&[b'a'; 120]), "f34c1488385346a55709ba056ddd08280dd4c6d6");
+        assert_eq!(
+            hex(&[b'a'; 120]),
+            "f34c1488385346a55709ba056ddd08280dd4c6d6"
+        );
     }
 }

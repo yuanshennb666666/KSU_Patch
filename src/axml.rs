@@ -36,13 +36,17 @@ struct StringPool<'a> {
 
 impl<'a> StringPool<'a> {
     fn parse(buf: &'a [u8], base: usize) -> Result<StringPool<'a>, String> {
-        if base + 28 > buf.len() {
+        if base.checked_add(28).map_or(true, |v| v > buf.len()) {
             return Err("string pool chunk header is out of range".to_string());
         }
         let count = u32le(buf, base + 8) as usize;
         let flags = u32le(buf, base + 16);
         let strings_start = u32le(buf, base + 20) as usize;
-        if base + 28 + count * 4 > buf.len() {
+        let table_end = count
+            .checked_mul(4)
+            .and_then(|n| base.checked_add(28).and_then(|v| v.checked_add(n)))
+            .ok_or_else(|| "string pool offset table overflows".to_string())?;
+        if table_end > buf.len() {
             return Err(format!(
                 "string pool declares {} strings but the offset table is out of range",
                 count
@@ -52,10 +56,13 @@ impl<'a> StringPool<'a> {
         for i in 0..count {
             offsets.push(u32le(buf, base + 28 + i * 4));
         }
+        let data_start = base
+            .checked_add(strings_start)
+            .ok_or_else(|| "string pool data offset overflows".to_string())?;
         Ok(StringPool {
             buf,
             utf8: flags & 0x100 != 0,
-            data_start: base + strings_start,
+            data_start,
             offsets,
         })
     }
@@ -95,8 +102,7 @@ impl<'a> StringPool<'a> {
                     let lo = u16le(self.buf, p);
                     if (0xDC00..0xE000).contains(&lo) {
                         p += 2;
-                        let c = 0x1_0000
-                            + (((u as u32 - 0xD800) << 10) | (lo as u32 - 0xDC00));
+                        let c = 0x1_0000 + (((u as u32 - 0xD800) << 10) | (lo as u32 - 0xDC00));
                         if let Some(ch) = char::from_u32(c) {
                             s.push(ch);
                             continue;
@@ -134,17 +140,24 @@ pub fn parse(buf: &[u8]) -> Result<Manifest, String> {
     let mut out = Manifest::default();
     let mut off = if header_size >= 8 { header_size } else { 8 };
 
-    while off + 8 <= end {
+    while off.checked_add(8).is_some_and(|v| v <= end) {
         let ctype = u16le(buf, off);
         let csize = u32le(buf, off + 4) as usize;
-        if csize < 8 || off + csize > end {
+        if csize < 8 {
             break;
         }
+        let next = match off.checked_add(csize) {
+            Some(v) if v <= end => v,
+            _ => break,
+        };
         match ctype {
             CHUNK_STRING_POOL => {
                 pool = Some(StringPool::parse(buf, off)?);
             }
             CHUNK_XML_START_TAG => {
+                if off.checked_add(30).is_none_or(|v| v > end) {
+                    break;
+                }
                 if let Some(sp) = &pool {
                     let tag = sp.get(u32le(buf, off + 20)).unwrap_or_default();
                     if tag == "manifest" {
@@ -155,30 +168,31 @@ pub fn parse(buf: &[u8]) -> Result<Manifest, String> {
             }
             _ => {}
         }
-        off += csize;
+        off = next;
     }
     Ok(out)
 }
 
-fn read_manifest_attrs(
-    buf: &[u8],
-    off: usize,
-    end: usize,
-    sp: &StringPool,
-    out: &mut Manifest,
-) {
+fn read_manifest_attrs(buf: &[u8], off: usize, end: usize, sp: &StringPool, out: &mut Manifest) {
     // ResXMLTree_node is 16 bytes; ResXMLTree_attrExt starts right after it and
     // `attributeStart` is relative to that.
+    if off.checked_add(30).is_none_or(|v| v > end) {
+        return;
+    }
     let attr_start = u16le(buf, off + 24) as usize;
     let attr_size = u16le(buf, off + 26) as usize;
     let attr_count = u16le(buf, off + 28) as usize;
     if attr_size < 20 {
         return;
     }
-    let base = off + 16 + attr_start;
+    let Some(base) = off.checked_add(16).and_then(|v| v.checked_add(attr_start)) else {
+        return;
+    };
     for i in 0..attr_count {
-        let a = base + i * attr_size;
-        if a + 20 > end || a + 20 > buf.len() {
+        let Some(a) = i.checked_mul(attr_size).and_then(|v| base.checked_add(v)) else {
+            break;
+        };
+        if a.checked_add(20).is_none_or(|v| v > end || v > buf.len()) {
             break;
         }
         let name = sp.get(u32le(buf, a + 4)).unwrap_or_default();

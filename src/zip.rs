@@ -85,18 +85,32 @@ impl Zip {
                     "ZIP64 archive but the ZIP64 end-of-central-directory locator is missing"
                         .to_string()
                 })?;
-            let z64 = u64le(&data, loc + 8) as usize;
-            if z64 + 56 > data.len() || u32le(&data, z64) != SIG_EOCD64 {
+            let z64 = usize::try_from(u64le(&data, loc + 8))
+                .map_err(|_| "ZIP64 end-of-central-directory offset is too large".to_string())?;
+            let z64_end = z64
+                .checked_add(56)
+                .ok_or_else(|| "ZIP64 end-of-central-directory offset overflows".to_string())?;
+            if z64_end > data.len() || u32le(&data, z64) != SIG_EOCD64 {
                 return Err("ZIP64 end-of-central-directory record is out of range".to_string());
             }
             entry_count = u64le(&data, z64 + 32);
             cd_off = u64le(&data, z64 + 48);
         }
 
-        let mut entries = Vec::with_capacity(entry_count.min(4096) as usize);
-        let mut off = cd_off as usize;
+        let max_entries = data.len() / 46 + 1;
+        if entry_count > max_entries as u64 {
+            return Err(format!(
+                "archive declares {entry_count} entries, more than the file can hold"
+            ));
+        }
+        let mut entries = Vec::with_capacity(entry_count as usize);
+        let mut off = usize::try_from(cd_off)
+            .map_err(|_| "central directory offset is too large".to_string())?;
         for i in 0..entry_count {
-            if off + 46 > data.len() {
+            let entry_end = off
+                .checked_add(46)
+                .ok_or_else(|| "central directory offset overflows".to_string())?;
+            if entry_end > data.len() {
                 return Err(format!(
                     "central directory entry #{} runs past end of file (offset {:#X}, file size {})",
                     i,
@@ -120,15 +134,23 @@ impl Zip {
             let comment_len = u16le(&data, off + 32) as usize;
             let mut local_off = u32le(&data, off + 42) as u64;
 
-            let name_end = off + 46 + name_len;
+            let name_end = off
+                .checked_add(46)
+                .and_then(|v| v.checked_add(name_len))
+                .ok_or_else(|| format!("central directory entry #{} name offset overflows", i))?;
             if name_end > data.len() {
-                return Err(format!("central directory entry #{} has a truncated name", i));
+                return Err(format!(
+                    "central directory entry #{} has a truncated name",
+                    i
+                ));
             }
             let name = String::from_utf8_lossy(&data[off + 46..name_end]).into_owned();
 
             // ZIP64 extended information extra field (id 0x0001) carries the real 64-bit
             // values for whichever 32-bit fields were saturated, in a fixed order.
-            let extra_end = name_end + extra_len;
+            let extra_end = name_end
+                .checked_add(extra_len)
+                .ok_or_else(|| format!("central directory entry #{} extra offset overflows", i))?;
             if extra_end <= data.len() {
                 let extra = &data[name_end..extra_end];
                 let mut x = 0usize;
@@ -164,7 +186,9 @@ impl Zip {
                 usize_,
                 local_off,
             });
-            off = extra_end + comment_len;
+            off = extra_end
+                .checked_add(comment_len)
+                .ok_or_else(|| format!("central directory entry #{} offset overflows", i))?;
         }
 
         Ok(Zip { data, entries })
@@ -176,8 +200,12 @@ impl Zip {
 
     /// Extract one entry, inflating it when necessary.
     pub fn read(&self, e: &Entry) -> Result<Vec<u8>, String> {
-        let o = e.local_off as usize;
-        if o + 30 > self.data.len() {
+        let o = usize::try_from(e.local_off)
+            .map_err(|_| format!("local header for `{}` offset is too large", e.name))?;
+        let local_end = o
+            .checked_add(30)
+            .ok_or_else(|| format!("local header for `{}` offset overflows", e.name))?;
+        if local_end > self.data.len() {
             return Err(format!(
                 "local header for `{}` at {:#X} is out of range",
                 e.name, o
@@ -193,8 +221,16 @@ impl Zip {
         }
         let name_len = u16le(&self.data, o + 26) as usize;
         let extra_len = u16le(&self.data, o + 28) as usize;
-        let start = o + 30 + name_len + extra_len;
-        let end = start + e.csize as usize;
+        let start = o
+            .checked_add(30)
+            .and_then(|v| v.checked_add(name_len))
+            .and_then(|v| v.checked_add(extra_len))
+            .ok_or_else(|| format!("entry `{}` payload offset overflows", e.name))?;
+        let size = usize::try_from(e.csize)
+            .map_err(|_| format!("entry `{}` compressed size is too large", e.name))?;
+        let end = start
+            .checked_add(size)
+            .ok_or_else(|| format!("entry `{}` payload offset overflows", e.name))?;
         if end > self.data.len() {
             return Err(format!(
                 "entry `{}` payload is truncated: needs bytes {}..{} but the file is {} bytes",
@@ -226,7 +262,7 @@ fn find_eocd(data: &[u8]) -> Result<usize, String> {
     loop {
         if u32le(data, i) == SIG_EOCD {
             let clen = u16le(data, i + 20) as usize;
-            if i + 22 + clen == n {
+            if i.checked_add(22).and_then(|v| v.checked_add(clen)) == Some(n) {
                 return Ok(i);
             }
         }

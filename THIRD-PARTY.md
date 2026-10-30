@@ -40,16 +40,15 @@ removed from a distribution without breaking the build.
 - Derived from: the launcher icon inside the KernelSU Manager APK
 - KernelSU upstream: <https://github.com/tiann/KernelSU> — GPL-3.0
 
-Used as the executable's icon. `tools/make_icon.py` regenerates it from a KernelSU APK, so
-the file can be dropped and rebuilt, or left out entirely — the build then produces an
-executable with the default icon.
+Used as the executable's icon, but only when the build opts in (`build.bat icon` or
+`KSUPATCH_ICON=1`); the default build leaves it out to keep the packed executable small.
+The icon can be replaced with any `.ico` file, or removed from the build entirely.
 
 ## KernelSU itself
 
-`ksupatch` reads a KernelSU release APK that the user supplies and extracts the kernel
-module and `ksuinit` from it. No part of KernelSU is redistributed in this repository: the
-APK is never committed (see `.gitignore`), and the extracted payload only ever ends up in
-the patched image the user builds for their own device.
+`ksupatch` reads a KernelSU-family release APK that the user supplies and extracts the
+kernel module and `ksuinit` from it. The APK is never committed (see `.gitignore`), and no
+KernelSU code is redistributed in this repository.
 
 ## Rust dependencies
 
